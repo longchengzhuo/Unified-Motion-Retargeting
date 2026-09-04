@@ -1,0 +1,48 @@
+# The only dependency list for UMR.
+#
+#   conda env create -f environment.yml
+#   conda activate umr
+#
+# Versions are pinned to what this project was tested against.
+name: umr
+
+channels:
+  - conda-forge
+  - nodefaults          # repo.anaconda.com is unreachable on some networks
+
+dependencies:
+  - python=3.10
+  - pip
+
+  - pip:
+      # --- kinematics, optimisation, solvers ---
+      - mujoco==3.9.0           # forward kinematics, Jacobians, rendering, simulation
+      - mink==1.1.1             # differential IK on MuJoCo; our Task/Limit subclasses derive from it
+      - qpsolvers==4.12.0       # QP dispatch layer used by mink
+      - clarabel==0.11.1        # the paper's QP/SOCP solver; its cones back --trust_region l2
+
+      # --- numerics and geometry ---
+      - numpy==2.2.6
+      - scipy==1.15.3           # rotations, KD-trees, Savitzky-Golay, convex hulls
+      - trimesh==5.1.0          # surface sampling, nearest-face snapping
+      - rtree==1.4.1            # speeds up trimesh proximity queries
+
+      # --- Stage I correspondence network ---
+      # The GPU is only used here, and it is optional (falls back to CPU automatically).
+      # This wheel bundles the CUDA runtime (~2.7 GB); only an NVIDIA driver is needed,
+      # no system CUDA Toolkit. For a CPU-only install, replace the line below with:
+      #   - --extra-index-url https://download.pytorch.org/whl/cpu
+      #   - torch==2.12.0+cpu
+      - torch==2.12.0
+
+      # --- config, visualisation, export ---
+      - PyYAML==6.0.3
+      - glfw==2.10.0            # interactive player; needs raw PRESS/RELEASE events
+      - imageio==2.37.3
+      - imageio-ffmpeg==0.6.0   # mp4 export
+      - matplotlib==3.10.9
+
+variables:
+  # Packages under ~/.local/lib/pythonX.Y/site-packages shadow this env.
+  # Disabling user site avoids the resulting version mismatches.
+  PYTHONNOUSERSITE: "1"

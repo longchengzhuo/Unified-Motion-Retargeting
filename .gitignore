@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors
+.idea/
+.vscode/
+.DS_Store
+
+# Pipeline artifacts
+outputs/
+MUJOCO_LOG.TXT

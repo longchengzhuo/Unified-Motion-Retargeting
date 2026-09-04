@@ -1,0 +1,71 @@
+# UMR 配置：Unitree G1 (29 DoF, rev 1.0) + Xsens BVH 源
+# 换机器人只需要改 robot 段，其余超参不用重调。
+
+robot:
+  name: g1_29dof_rev_1_0
+  xml: assets/robots/g1_description/xml/g1_29dof_rev_1_0.xml
+  root_body: pelvis
+  tpose_joints:
+    left_shoulder_roll_joint: 1.5708
+    right_shoulder_roll_joint: -1.5708
+  # G1 的 MJCF 里没有纯标记 body
+  marker_body_prefixes: []
+  marker_body_suffixes: []
+  foot_name_keys: ["ankle", "foot"]
+  foot_bodies: ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+source:
+  type: xsens_bvh
+  bvh: data/walk_slow.bvh
+  # BVH 为 Y-up / 厘米，转换到 MuJoCo 的 X 前 / Y 左 / Z 上 / 米
+  length_scale: 0.01
+  auto_face_x: true
+  target_fps: 30
+
+sampling:
+  n_points: 4096        # 论文的 N，人机点云同为 N
+  oversample: 8.0       # 先超采样再做内点剔除 + FPS
+  cull_margin: 0.006    # 判定落在其它 geom 内部的深度阈值（米）
+  seed: 0
+
+# ---------------------------------------------------------------
+# Stage I: 点云对应学习（论文 III-B，式 1-5）
+# ---------------------------------------------------------------
+correspondence:
+  latent_dim: 512
+  encoder_channels: [3, 64, 128, 256, 512]
+  decoder_hidden: [512, 512, 256]
+  epochs: 2500
+  lr: 1.0e-3
+  weight_decay: 0.0
+  # 权重经扫参确定：Chamfer 主导拟合，排斥与边平滑保持点云不塌缩、对应连贯。
+  # 取值区间与扫参结论见 docs/TECHNICAL.md。
+  lambda_chamfer: 1.0      # λ_c
+  lambda_repulsion: 0.01   # λ_r
+  lambda_edge: 0.05        # λ_e
+  repulsion_k: 8           # 式 (4) 的 K_r
+  repulsion_radius: 0.015  # 式 (4) 的 r（米）
+  geodesic_k: 8            # 分段感知 kNN 图的邻居数
+  seed: 0
+  device: auto          # auto | cuda | cpu —— GPU 只在本阶段用到
+
+# ---------------------------------------------------------------
+# Stage II: 对应引导的重定向（论文 III-C，式 6-14）
+# ---------------------------------------------------------------
+retarget:
+  n_selected: 512          # 式 (7) 的选中点集 |I|
+  iterations: 6            # 每帧的 Gauss-Newton 迭代次数
+  dt: 0.02                 # mink 的积分步长
+  damping: 1.0e-3          # 式 (13) 的 μ
+  solver: clarabel         # 论文所用 QP/SOCP 求解器
+  trust_region: box        # box | l2   —— l2 走 Clarabel SOCP 分支
+  trust_region_radius: 0.35  # 式 (13) 的 η（弧度，作用于 Δq）
+  max_velocity: 12.0       # mink VelocityLimit 的速度上限（rad/s）
+  floor_height: 0.0        # 式 (14) 的 z_f
+  floor_band: 0.06         # 只对低于 z_f+band 的机器人表面点施加净空约束
+  floor_margin: 0.002      # 允许的最小离地间隙
+  contact_threshold: 0.05  # 式 (11) 的 τ_c（米）
+  contact_weight: 4.0      # 式 (8) 的 w^c
+  posture_cost: 0.02       # mink PostureTask，向零位做弱正则
+  self_collision: false    # mink CollisionAvoidanceLimit（较慢，默认关闭）
+  root_task_cost: 0.0      # 可选的根部 FrameTask，0 表示不用
