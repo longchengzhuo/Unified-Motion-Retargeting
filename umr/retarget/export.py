@@ -1,6 +1,7 @@
 """重定向结果的导出。
 
-pkl 采用与 `agmr` / GMR 相同的字段命名（``root_trans`` / ``root_rot`` / ``dof`` /
+pkl 采用与 `GMR <https://github.com/YanjieZe/GMR>`_ 相同的字段命名
+（``root_trans`` / ``root_rot`` / ``dof`` /
 ``dof_full`` / ``fps`` / ``dof_names`` / ``body_names``），因此可以直接喂给已有的
 下游工具；另外附带 UMR 自己的 ``qpos`` 与质量指标。
 
@@ -39,7 +40,7 @@ def motion_to_dict(
     fps: float,
     extra: dict | None = None,
 ) -> dict:
-    """把 qpos 序列整理成与 agmr/GMR 兼容的字典。"""
+    """把 qpos 序列整理成与 GMR 兼容的字典。"""
     qpos = np.asarray(qpos, dtype=np.float64)
     out = {
         "root_trans": qpos[:, 0:3].copy(),

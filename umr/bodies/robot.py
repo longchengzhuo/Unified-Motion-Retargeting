@@ -13,11 +13,11 @@ Jacobian；把它转回世界系后，同一 body 上任意点的 Jacobian 都�
 
 from __future__ import annotations
 
-import json
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Any
 
 import mink
 import mujoco
@@ -25,94 +25,53 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-@dataclass
+@dataclass(frozen=True)
 class RobotSpec:
-    """一台机器人在 MJCF 之外还需要的少量语义信息。
+    """一台机器人的形态约定，对应配置里的 ``robot`` 段。
 
-    全部来自配置文件的 ``robot`` 段，因此换机器人不需要改代码。
-
-    Attributes:
-        name: 展示用名称。
-        root_body: 浮动基所在的 body；留空则取世界下的第一个 body。
-        tpose_joints: canonical T-pose 中需要偏置的关节角（其余为 0）。
-        marker_body_prefixes: 纯标记 body 的名字前缀，其 geom 不算外表面。
-        marker_body_suffixes: 同上，按后缀匹配。
-        foot_name_keys: 判定"属于足部"的 body 名子串。
-        foot_bodies: 左/右脚的末端 body；留空则按 ``foot_name_keys`` 自动推断。
+    默认值取通行的人形命名，配置里不写这些键也能跑。换机型时在 yaml 里覆盖需要改
+    的那几项即可，不必动代码。
     """
 
-    name: str = "robot"
-    root_body: str = ""
-    tpose_joints: dict[str, float] = field(default_factory=dict)
+    #: canonical T-pose 的关节角，其余关节取 0。注意"零位即伸直"不是通例：G1 的肘
+    #: 角为 0 时前臂垂直于上臂，只设肩 roll 会得到一个前倾 46 度、肩到腕仅 0.28 m
+    #: 的假 T-pose；肘角取 +90 度才真正伸直（前倾 0.9 度，0.37 m）。
+    tpose_joints: dict[str, float] = field(
+        default_factory=lambda: {
+            "left_shoulder_roll_joint": 1.5708,
+            "right_shoulder_roll_joint": -1.5708,
+        }
+    )
+    #: 这些 body 上的 geom 只是标记点，不属于机器人表面。有的 MJCF 会把接触点、
+    #: 抓取点单独挂成 body，采表面时必须排除掉，否则会采到悬空的小球上。
     marker_body_prefixes: tuple[str, ...] = ()
     marker_body_suffixes: tuple[str, ...] = ()
+    #: 求 robot_foot_height 用的踝 link。
+    foot_bodies: tuple[str, ...] = ("left_ankle_roll_link", "right_ankle_roll_link")
+    #: 找足底几何时匹配的 body 名关键字（见 :func:`sole_sample_points`）。
     foot_name_keys: tuple[str, ...] = ("ankle", "foot")
-    foot_bodies: tuple[str, ...] = ()
 
     @classmethod
-    def from_config(cls, robot_cfg: Mapping) -> "RobotSpec":
-        return cls(
-            name=str(robot_cfg.get("name", "robot")),
-            root_body=str(robot_cfg.get("root_body", "") or ""),
-            tpose_joints={str(k): float(v) for k, v in (robot_cfg.get("tpose_joints") or {}).items()},
-            marker_body_prefixes=tuple(robot_cfg.get("marker_body_prefixes") or ()),
-            marker_body_suffixes=tuple(robot_cfg.get("marker_body_suffixes") or ()),
-            foot_name_keys=tuple(robot_cfg.get("foot_name_keys") or ("ankle", "foot")),
-            foot_bodies=tuple(robot_cfg.get("foot_bodies") or ()),
-        )
+    def from_config(cls, robot_cfg: Mapping[str, Any]) -> RobotSpec:
+        """从配置的 ``robot`` 段构造，没写的键沿用默认值。"""
+        kwargs: dict[str, Any] = {}
+        if "tpose_joints" in robot_cfg:
+            kwargs["tpose_joints"] = {
+                str(k): float(v) for k, v in robot_cfg["tpose_joints"].items()
+            }
+        for key in (
+            "marker_body_prefixes",
+            "marker_body_suffixes",
+            "foot_bodies",
+            "foot_name_keys",
+        ):
+            if key in robot_cfg:
+                kwargs[key] = tuple(str(v) for v in robot_cfg[key])
+        return cls(**kwargs)
 
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
 
-    @classmethod
-    def from_json(cls, text: str) -> "RobotSpec":
-        return cls.from_config(json.loads(text))
-
-    # ------------------------------------------------------------------
-    def is_marker(self, body_name: str) -> bool:
-        return body_name.startswith(self.marker_body_prefixes) or body_name.endswith(
-            self.marker_body_suffixes
-        )
-
-    def resolve(self, model: mujoco.MjModel) -> "RobotSpec":
-        """填上可以从模型本身推断出来的字段。"""
-        names = [
-            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or f"body{b}"
-            for b in range(model.nbody)
-        ]
-        root = self.root_body or (names[1] if model.nbody > 1 else "")
-        if root not in names:
-            raise ValueError(f"模型里没有 root_body={root!r}")
-
-        feet = tuple(self.foot_bodies)
-        if not feet:
-            # 每侧取名字命中 foot_name_keys 且在运动链上最深的那个 body
-            def deepest(side_keys: tuple[str, ...]) -> str | None:
-                hits = [
-                    n for n in names[1:]
-                    if any(k in n for k in self.foot_name_keys)
-                    and any(k in n for k in side_keys)
-                    and not self.is_marker(n)
-                ]
-                return hits[-1] if hits else None
-
-            feet = tuple(f for f in (deepest(("left", "_l_")), deepest(("right", "_r_"))) if f)
-        missing = [f for f in feet if f not in names]
-        if missing:
-            raise ValueError(f"模型里没有足部 body {missing}")
-        if not feet:
-            raise ValueError(
-                f"无法从 foot_name_keys={self.foot_name_keys} 推断足部 body，请在配置里写明 robot.foot_bodies"
-            )
-        return RobotSpec(
-            name=self.name,
-            root_body=root,
-            tpose_joints=dict(self.tpose_joints),
-            marker_body_prefixes=self.marker_body_prefixes,
-            marker_body_suffixes=self.marker_body_suffixes,
-            foot_name_keys=self.foot_name_keys,
-            foot_bodies=feet,
-        )
+#: 不给 spec 时的兜底。
+DEFAULT_SPEC = RobotSpec()
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -128,7 +87,15 @@ def skew(v: np.ndarray) -> np.ndarray:
     return z
 
 
-def tpose_qpos(model: mujoco.MjModel, spec: RobotSpec, ground: bool = True) -> np.ndarray:
+def is_marker_body(name: str, spec: RobotSpec = DEFAULT_SPEC) -> bool:
+    return name.startswith(spec.marker_body_prefixes) or name.endswith(
+        spec.marker_body_suffixes
+    )
+
+
+def tpose_qpos(
+    model: mujoco.MjModel, ground: bool = True, spec: RobotSpec = DEFAULT_SPEC
+) -> np.ndarray:
     """构造机器人的 canonical T-pose qpos，并把脚底贴到 z=0。"""
     q = np.zeros(model.nq)
     q[3] = 1.0
@@ -146,7 +113,9 @@ def tpose_qpos(model: mujoco.MjModel, spec: RobotSpec, ground: bool = True) -> n
     return q
 
 
-def lowest_surface_z(model: mujoco.MjModel, data: mujoco.MjData, spec: RobotSpec) -> float:
+def lowest_surface_z(
+    model: mujoco.MjModel, data: mujoco.MjData, spec: RobotSpec = DEFAULT_SPEC
+) -> float:
     """当前姿态下机器人表面（不含世界几何与标记点）的最低 z。"""
     lows = []
     for g in range(model.ngeom):
@@ -154,7 +123,7 @@ def lowest_surface_z(model: mujoco.MjModel, data: mujoco.MjData, spec: RobotSpec
         if b == 0:
             continue
         bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
-        if spec.is_marker(bname):
+        if is_marker_body(bname, spec):
             continue
         lows.append(geom_lowest_z(model, data, g))
     return float(min(lows))
@@ -185,7 +154,7 @@ def geom_lowest_z(model: mujoco.MjModel, data: mujoco.MjData, g: int) -> float:
 
 
 def sole_sample_points(
-    model: mujoco.MjModel, spec: RobotSpec
+    model: mujoco.MjModel, name_keys: tuple[str, ...] = ("ankle", "foot")
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """足底的极值几何点，用于施加式 (14) 的地面净空约束。
 
@@ -206,7 +175,7 @@ def sole_sample_points(
         if b == 0:
             continue
         bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
-        if not any(k in bname for k in spec.foot_name_keys):
+        if not any(k in bname for k in name_keys):
             continue
         gtype = int(model.geom_type[g])
         size = model.geom_size[g]
@@ -237,10 +206,10 @@ def sole_sample_points(
 
 def prepare_robot_xml(
     src_xml: str | Path,
-    spec: RobotSpec,
     dst_xml: str | Path | None = None,
     offwidth: int = 1920,
     offheight: int = 1080,
+    spec: RobotSpec = DEFAULT_SPEC,
 ) -> Path:
     """把机器人 MJCF 准备成 UMR 可用的形式。
 
@@ -254,7 +223,7 @@ def prepare_robot_xml(
     dst_xml = Path(dst_xml) if dst_xml is not None else src_xml
 
     model = mujoco.MjModel.from_xml_path(str(src_xml))
-    q = tpose_qpos(model, spec.resolve(model))
+    q = tpose_qpos(model, spec=spec)
 
     tree = ET.parse(src_xml)
     root = tree.getroot()
@@ -355,10 +324,10 @@ def point_kinematics(
 class RobotBody:
     """机器人的 mink 封装。"""
 
-    def __init__(self, xml_path: str | Path, spec: RobotSpec):
+    def __init__(self, xml_path: str | Path, spec: RobotSpec = DEFAULT_SPEC):
         self.xml_path = str(xml_path)
+        self.spec = spec
         self.model = mujoco.MjModel.from_xml_path(self.xml_path)
-        self.spec = spec.resolve(self.model)
         self.configuration = mink.Configuration(self.model)
         self.nv = int(self.model.nv)
         self.body_names = [
@@ -380,7 +349,7 @@ class RobotBody:
         if key >= 0:
             self.configuration.update_from_keyframe("T_pose")
         else:
-            self.configuration.update(q=tpose_qpos(self.model, self.spec))
+            self.configuration.update(q=tpose_qpos(self.model, spec=self.spec))
 
     def set_qpos(self, q: np.ndarray) -> None:
         self.configuration.update(q=np.asarray(q, dtype=np.float64))
@@ -401,6 +370,24 @@ class RobotBody:
         return point_kinematics(body_index, local_pos, local_normal, jac)
 
     # ------------------------------------------------------------------
+    def surface_geoms(self) -> list[int]:
+        """参与表面采样的 geom。
+
+        取 visual 组（group==1，代表真实外形）加上所有基元 geom（脚底的 box/球在
+        collision 组里，但它们才是真正的足底表面），并排除标记点 body。
+        """
+        m = self.model
+        out = []
+        for g in range(m.ngeom):
+            b = int(m.geom_bodyid[g])
+            if b == 0 or is_marker_body(self.body_names[b], self.spec):
+                continue
+            is_visual = int(m.geom_group[g]) == 1
+            is_primitive = int(m.geom_type[g]) != mujoco.mjtGeom.mjGEOM_MESH
+            if is_visual or is_primitive:
+                out.append(g)
+        return out
+
     def height(self) -> float:
         """T-pose 下机器人从脚底到头顶的高度。"""
         q_save = self.q
@@ -410,7 +397,7 @@ class RobotBody:
         highs = []
         for g in range(self.model.ngeom):
             b = int(self.model.geom_bodyid[g])
-            if b == 0 or self.spec.is_marker(self.body_names[b]):
+            if b == 0 or is_marker_body(self.body_names[b], self.spec):
                 continue
             R = data.geom_xmat[g].reshape(3, 3)
             c = data.geom_xpos[g]
@@ -437,11 +424,6 @@ class RobotBody:
         low = lowest_surface_z(self.model, data, self.spec)
         self.set_qpos(q_save)
         return ankle_z - low
-
-    @staticmethod
-    def from_bodies(bodies) -> "RobotBody":
-        """从 ``scripts/01_build_bodies.py`` 写出的 ``bodies.npz`` 还原。"""
-        return RobotBody(str(bodies["robot_xml"]), RobotSpec.from_json(str(bodies["robot_spec"])))
 
     def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """返回按 qpos 索引的关节上下限（free joint 部分为 +-inf）。"""

@@ -20,42 +20,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from umr.bodies.bvh import BvhData
+from umr.bodies.skeletons import DEFAULT_HUMAN, Skeleton, get_skeleton
 
 # 各分段几何参数以身高 1.8 m 为参考，实际按演员身高线性缩放。
 HEIGHT_REF = 1.8
 
-#: 每个 BVH 关节的表面几何定义。
-#:   seg   : 分段标签，用于残差权重与对应关系着色（机器人点通过学到的对应继承它）
-#:   kind  : capsule | ellipsoid | box
-#:   axis  : 用于定义骨骼轴向的子关节名；"END" 表示使用 End Site
-#:   radius: capsule 半径（参考身高下，米）
-#:   size  : ellipsoid 的三个半轴 / box 的 (沿轴向额外留量, 半宽, 半高)
-#:   along : 几何中心沿骨骼轴向的比例位置
-SEGMENT_SPECS: dict[str, dict] = {
-    "Hips": dict(seg="pelvis", kind="ellipsoid", axis="Chest", size=(0.115, 0.150, 0.120), along=0.35),
-    "Chest": dict(seg="torso", kind="capsule", axis="Chest2", radius=0.128),
-    "Chest2": dict(seg="torso", kind="capsule", axis="Chest3", radius=0.136),
-    "Chest3": dict(seg="torso", kind="capsule", axis="Chest4", radius=0.142),
-    "Chest4": dict(seg="chest", kind="ellipsoid", axis="Neck", size=(0.115, 0.185, 0.135), along=0.30),
-    "Neck": dict(seg="neck", kind="capsule", axis="Head", radius=0.055),
-    "Head": dict(seg="head", kind="ellipsoid", axis="END", size=(0.098, 0.088, 0.115), along=0.55),
-    "LeftCollar": dict(seg="l_clavicle", kind="capsule", axis="LeftShoulder", radius=0.056),
-    "LeftShoulder": dict(seg="l_upperarm", kind="capsule", axis="LeftElbow", radius=0.052),
-    "LeftElbow": dict(seg="l_forearm", kind="capsule", axis="LeftWrist", radius=0.044),
-    "LeftWrist": dict(seg="l_hand", kind="capsule", axis="END", radius=0.038),
-    "RightCollar": dict(seg="r_clavicle", kind="capsule", axis="RightShoulder", radius=0.056),
-    "RightShoulder": dict(seg="r_upperarm", kind="capsule", axis="RightElbow", radius=0.052),
-    "RightElbow": dict(seg="r_forearm", kind="capsule", axis="RightWrist", radius=0.044),
-    "RightWrist": dict(seg="r_hand", kind="capsule", axis="END", radius=0.038),
-    "LeftHip": dict(seg="l_thigh", kind="capsule", axis="LeftKnee", radius=0.086),
-    "LeftKnee": dict(seg="l_shin", kind="capsule", axis="LeftAnkle", radius=0.060),
-    "LeftAnkle": dict(seg="l_foot", kind="box", axis="LeftToe", size=(0.010, 0.045, 0.032)),
-    "LeftToe": dict(seg="l_toe", kind="box", axis="END", size=(0.005, 0.042, 0.022)),
-    "RightHip": dict(seg="r_thigh", kind="capsule", axis="RightKnee", radius=0.086),
-    "RightKnee": dict(seg="r_shin", kind="capsule", axis="RightAnkle", radius=0.060),
-    "RightAnkle": dict(seg="r_foot", kind="box", axis="RightToe", size=(0.010, 0.045, 0.032)),
-    "RightToe": dict(seg="r_toe", kind="box", axis="END", size=(0.005, 0.042, 0.022)),
-}
+# 每个 BVH 关节的表面几何定义按源骨架分别给出，见 umr.bodies.skeletons。
 
 #: 分段之间的相邻关系（用于分段感知测地图，避免左右腿贴近时误连边）。
 SEGMENT_ADJACENCY: list[tuple[str, str]] = [
@@ -145,6 +115,7 @@ def build_human_mjcf(
     bvh: BvhData,
     scale: float = 1.0,
     model_name: str = "umr_human",
+    human: str | Skeleton = DEFAULT_HUMAN,
 ) -> tuple[str, HumanModelInfo]:
     """由 BVH 层级生成人体 MJCF 字符串。
 
@@ -152,11 +123,22 @@ def build_human_mjcf(
         bvh: 已转换到 MuJoCo 坐标系的 BVH 数据。
         scale: 整体缩放（用于把演员归一化到机器人身高）。
         model_name: MJCF 模型名。
+        human: 源骨架标识或 :class:`~umr.bodies.skeletons.Skeleton`，决定关节名
+            到表面几何的映射。
 
     Returns:
         ``(xml_string, info)``。
     """
     from umr.bodies.bvh import actor_height as _actor_height
+
+    skeleton = human if isinstance(human, Skeleton) else get_skeleton(human)
+    segment_specs = skeleton.segments
+    missing = [j for j in segment_specs if j not in bvh.names]
+    if missing:
+        raise ValueError(
+            f"BVH 不含 {skeleton.name} 骨架的关节 {missing[:5]}（共 {len(missing)} 个）。"
+            f"检查 --human 是否选对，文件实际关节: {bvh.names[:8]}…"
+        )
 
     h_actor = _actor_height(bvh)
     geom_scale = (h_actor * scale) / HEIGHT_REF
@@ -180,6 +162,7 @@ def build_human_mjcf(
     geom_segment: dict[str, str] = {}
     body_elems: dict[int, ET.Element] = {}
     body_names: list[str] = []
+    geomless: list[ET.Element] = []
 
     for j, jname in enumerate(bvh.names):
         parent = int(bvh.parents[j])
@@ -197,8 +180,9 @@ def build_human_mjcf(
         body_elems[j] = elem
         body_names.append(body_name(jname))
 
-        spec = SEGMENT_SPECS.get(jname)
+        spec = segment_specs.get(jname)
         if spec is None:
+            geomless.append(elem)
             continue
         seg = spec["seg"]
         d = _axis_vector(bvh, j, spec, scale)
@@ -246,6 +230,14 @@ def build_human_mjcf(
         else:
             raise ValueError(f"未知几何类型: {spec['kind']}")
 
+    # 没有表面几何的关节（FZMotion 的手指与 *End 末端节点）质量为零，而 MuJoCo
+    # 要求带关节的 body 质量大于 mjMINVAL。人体模型只跑 FK、不参与动力学，给个
+    # 名义惯量即可。
+    for elem in geomless:
+        elem.insert(0, ET.Element(
+            "inertial", pos="0 0 0", mass="1e-6", diaginertia="1e-9 1e-9 1e-9"
+        ))
+
     ET.indent(root, space="  ")
     xml = ET.tostring(root, encoding="unicode")
 
@@ -261,10 +253,13 @@ def build_human_mjcf(
 
 
 def write_human_mjcf(
-    bvh: BvhData, out_path: str | Path, scale: float = 1.0
+    bvh: BvhData,
+    out_path: str | Path,
+    scale: float = 1.0,
+    human: str | Skeleton = DEFAULT_HUMAN,
 ) -> HumanModelInfo:
     """生成并写出人体 MJCF 文件。"""
-    xml, info = build_human_mjcf(bvh, scale=scale)
+    xml, info = build_human_mjcf(bvh, scale=scale, human=human)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(xml, encoding="utf-8")

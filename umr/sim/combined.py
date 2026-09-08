@@ -1,7 +1,7 @@
 """把机器人与源人体合并进同一个 MuJoCo 场景，便于实时并排对照。
 
 用 ``mujoco.MjSpec`` 把人体模型以 ``H_`` 前缀挂到机器人的 worldbody 上，得到一个
-包含两副骨架的模型：qpos 前段是机器人，后段是人体。
+包含两副骨架的模型：qpos 前段是机器人（nq=34），后段是人体（nq=95）。
 """
 
 from __future__ import annotations

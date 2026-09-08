@@ -4,10 +4,15 @@
 robot:
   name: g1_29dof_rev_1_0
   xml: assets/robots/g1_description/xml/g1_29dof_rev_1_0.xml
-  root_body: pelvis
+  # canonical T-pose 的关节角（其余为 0，base 高度由脚底贴地自动求出）。
+  # 注意 G1 的 elbow 零位不是伸直的：肘角为 0 时前臂垂直于上臂指向 +x，只设肩 roll
+  # 会得到一个前倾 45.9° 的"T-pose"，肩到腕只有 0.278 m。肘角取 +90° 才真正伸直
+  # （前倾 0.9°，肩到腕 0.368 m）。这一项直接决定 Stage 0/I 在什么姿态下建立对应。
   tpose_joints:
     left_shoulder_roll_joint: 1.5708
     right_shoulder_roll_joint: -1.5708
+    left_elbow_joint: 1.5708
+    right_elbow_joint: 1.5708
   # G1 的 MJCF 里没有纯标记 body
   marker_body_prefixes: []
   marker_body_suffixes: []
@@ -15,12 +20,11 @@ robot:
   foot_bodies: ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 source:
-  type: xsens_bvh
-  bvh: data/walk_slow.bvh
+  # 源动作的路径、骨架与帧率都由命令行给（--motion_file / --human / --tgt_fps），
+  # 这里只留与坐标系有关、跨片段不变的量。
   # BVH 为 Y-up / 厘米，转换到 MuJoCo 的 X 前 / Y 左 / Z 上 / 米
   length_scale: 0.01
   auto_face_x: true
-  target_fps: 30
 
 sampling:
   n_points: 4096        # 论文的 N，人机点云同为 N
@@ -39,7 +43,7 @@ correspondence:
   lr: 1.0e-3
   weight_decay: 0.0
   # 权重经扫参确定：Chamfer 主导拟合，排斥与边平滑保持点云不塌缩、对应连贯。
-  # 取值区间与扫参结论见 docs/TECHNICAL.md。
+  # λ_r / λ_e 取大（如 0.3 / 3.0）会让形变场退化成近似刚体平移，Chamfer 劣化一个量级。
   lambda_chamfer: 1.0      # λ_c
   lambda_repulsion: 0.01   # λ_r
   lambda_edge: 0.05        # λ_e
@@ -54,6 +58,13 @@ correspondence:
 # ---------------------------------------------------------------
 retarget:
   n_selected: 512          # 式 (7) 的选中点集 |I|
+  point_selection: fps     # fps | random —— 段内采样方式，random 会打散 Stage 0 攒的均匀性
+  # T-pose 偏置补偿，0 = 论文式 (7) 原式（残差里含人机形状差常量）。
+  # Stage 0 已经把人体按机器人身高归一化（1.673 m -> 1.323 m），所以 G1 手臂偏短
+  # 并不会在这里表现成一个特别大的偏置：T-pose 下各分段的偏置相当均匀（手 62 mm、
+  # 前臂 57 mm、躯干 53 mm、脚 51 mm），去均值后反而是足部最大（66~77 mm）。
+  # walk_slow 实测 alpha=1 为 12.1 mm / 5.4°，alpha=0 为 33.4 mm / 41.8°。
+  tpose_offset: 1.0
   iterations: 6            # 每帧的 Gauss-Newton 迭代次数
   dt: 0.02                 # mink 的积分步长
   damping: 1.0e-3          # 式 (13) 的 μ
@@ -67,5 +78,9 @@ retarget:
   contact_threshold: 0.05  # 式 (11) 的 τ_c（米）
   contact_weight: 4.0      # 式 (8) 的 w^c
   posture_cost: 0.02       # mink PostureTask，向零位做弱正则
-  self_collision: false    # mink CollisionAvoidanceLimit（较慢，默认关闭）
+  # G1 上必须开：它的腕部正好落在髋侧，手臂自然下垂的行走片段里腕会切进髋 link——
+  # walk_slow 实测 960 帧有 698 帧自碰撞、最深穿透 23.0 mm。开了之后降到 3.0 mm，
+  # 点匹配误差不变（12.1 mm）、QP 零失败，代价是慢约 25%（51 -> 39 FPS）。
+  # 手脚本来就不相碰的片段（如空翻）不会有约束被激活，开着也不亏。
+  self_collision: true     # mink CollisionAvoidanceLimit（较慢，四肢不相碰时可关）
   root_task_cost: 0.0      # 可选的根部 FrameTask，0 表示不用

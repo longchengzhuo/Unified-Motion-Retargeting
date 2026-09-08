@@ -20,11 +20,15 @@ BVH 帧的基向量为 (X=左, Y=上, Z=前)，所以转换矩阵是一个轴的
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
+
+from umr.bodies.skeletons import DEFAULT_HUMAN, Skeleton, get_skeleton
 
 # BVH (X=左, Y=上, Z=前) -> MuJoCo (X=前, Y=左, Z=上)
 BVH_TO_MUJOCO = np.array(
@@ -134,13 +138,23 @@ def _euler_order(rot_channels: list[str]) -> str:
     return "".join(_CHANNEL_TO_AXIS[c] for c in rot_channels)
 
 
-def read_bvh_raw(path: str | Path) -> tuple[list[str], np.ndarray, np.ndarray, dict[int, np.ndarray], np.ndarray, np.ndarray, float]:
-    """读取 BVH，返回 **未做坐标变换** 的原始数据（BVH 自身单位与朝向）。"""
+def read_bvh_raw(
+    path: str | Path, strip_prefix: bool = False
+) -> tuple[list[str], np.ndarray, np.ndarray, dict[int, np.ndarray], np.ndarray, np.ndarray, float]:
+    """读取 BVH，返回 **未做坐标变换** 的原始数据（BVH 自身单位与朝向）。
+
+    Args:
+        path: BVH 文件路径。
+        strip_prefix: 去掉导出器加在关节名前的前缀（``character1_Hips`` -> ``Hips``），
+            取最后一个下划线之后的部分。
+    """
     path = Path(path)
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
 
     names, parents, offsets, end_sites, channels, motion_idx = _parse_hierarchy(lines)
+    if strip_prefix:
+        names = [n.split("_")[-1] for n in names]
     n_joints = len(names)
 
     # --- MOTION 头 ---
@@ -201,22 +215,65 @@ def read_bvh_raw(path: str | Path) -> tuple[list[str], np.ndarray, np.ndarray, d
     return names, parents_arr, offsets_arr, end_sites, local_quat, root_pos, 1.0 / frame_time
 
 
+def skeleton_signature(path: str | Path, strip_prefix: bool = False) -> str:
+    """骨架签名：层级结构与骨骼 offset 的摘要，动作内容不参与。
+
+    Stage 0 生成的人体 MJCF 与 T-pose 点云、Stage I 学到的点云对应，只取决于这些
+    量，与演员后面做了什么动作无关。
+
+    注意这是**逐文件精确**的签名：FZMotion 这类会给每条 take 单独解算骨架的系统，
+    同一个演员不同 take 的 offset 能差到 1 cm，签名就会不同。要让它们共用一套对应
+    关系，走 ``--share_setup dir``（见 :func:`umr.stages.setup_signature`）。
+
+    只读到 MOTION 的第一行就停，不解析整个动作块——批处理时目录里每个文件都会调它。
+    """
+    head: list[str] = []
+    frame_time_at = None
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f):
+            head.append(line.rstrip("\n"))
+            if frame_time_at is None:
+                if line.lstrip().startswith("Frame Time:"):
+                    frame_time_at = i
+            elif i > frame_time_at:  # 拿到第一行动作数据即可
+                break
+
+    names, parents, offsets, end_sites, _channels, _idx = _parse_hierarchy(head)
+    if strip_prefix:
+        names = [n.split("_")[-1] for n in names]
+
+    h = hashlib.sha1()
+    h.update("|".join(names).encode("utf-8"))
+    h.update(np.asarray(parents, dtype=np.int64).tobytes())
+    h.update(np.round(np.asarray(offsets, dtype=np.float64), 3).tobytes())
+    for j in sorted(end_sites):
+        h.update(str(j).encode("utf-8"))
+        h.update(np.round(end_sites[j], 3).tobytes())
+    return h.hexdigest()[:16]
+
+
 def load_bvh(
     path: str | Path,
     scale: float = 0.01,
     transform: np.ndarray = BVH_TO_MUJOCO,
     auto_face_x: bool = True,
+    human: str | Skeleton = DEFAULT_HUMAN,
 ) -> BvhData:
     """加载 BVH 并转换到 MuJoCo 坐标系（X 前 / Y 左 / Z 上，单位米）。
 
     Args:
         path: BVH 文件路径。
-        scale: 长度缩放，Xsens 默认厘米故为 0.01。
+        scale: 长度缩放，Xsens / FZMotion 都是厘米故为 0.01。
         transform: 3x3 旋转矩阵，把 BVH 基向量映射到 MuJoCo 基向量。
         auto_face_x: 若为 True，用第 0 帧（T-pose）自动估计朝向并施加一个绕 Z
-            的偏航修正，使角色面向 +X。对不同 Xsens 导出配置更鲁棒。
+            的偏航修正，使角色面向 +X。对不同导出配置更鲁棒。
+        human: 源骨架标识或 :class:`~umr.bodies.skeletons.Skeleton`，决定关节
+            命名约定（前缀处理与朝向估计用哪些关节）。
     """
-    names, parents, offsets, end_sites, local_quat, root_pos, fps = read_bvh_raw(path)
+    skeleton = human if isinstance(human, Skeleton) else get_skeleton(human)
+    names, parents, offsets, end_sites, local_quat, root_pos, fps = read_bvh_raw(
+        path, strip_prefix=skeleton.strip_prefix
+    )
 
     R = np.asarray(transform, dtype=np.float64)
     offsets = (offsets * scale) @ R.T
@@ -241,7 +298,7 @@ def load_bvh(
     )
 
     if auto_face_x:
-        yaw = _estimate_facing_yaw(data)
+        yaw = _estimate_facing_yaw(data, skeleton)
         if abs(yaw) > 1e-6:
             Rz = Rotation.from_euler("z", -yaw).as_matrix()
             data = _rotate_world(data, Rz)
@@ -267,10 +324,11 @@ def _rotate_world(data: BvhData, R: np.ndarray) -> BvhData:
     )
 
 
-def _estimate_facing_yaw(data: BvhData) -> float:
+def _estimate_facing_yaw(data: BvhData, skeleton: Skeleton) -> float:
     """从第 0 帧估计角色朝向的偏航角（弧度）。
 
-    优先用 脚踝 -> 脚趾 的水平向量，退化时用 髋部连线的法向。
+    优先用 脚踝 -> 脚趾 的水平向量，退化时用 髋部连线的法向。用哪些关节由
+    ``skeleton`` 给出，因为 xsens 与 fzmotion 的命名完全不同。
     """
     pos, _ = forward_kinematics(data, frames=np.array([0]))
     pos = pos[0]
@@ -283,12 +341,12 @@ def _estimate_facing_yaw(data: BvhData) -> float:
         return None
 
     fwd = np.zeros(3)
-    for ankle, toe in (("LeftAnkle", "LeftToe"), ("RightAnkle", "RightToe")):
+    for ankle, toe in skeleton.foot_chains:
         ia, it = find(ankle), find(toe)
         if ia is not None and it is not None:
             fwd += pos[it] - pos[ia]
     if np.linalg.norm(fwd[:2]) < 1e-6:
-        il, ir = find("LeftHip"), find("RightHip")
+        il, ir = find(skeleton.hip_pair[0]), find(skeleton.hip_pair[1])
         if il is None or ir is None:
             return 0.0
         left = pos[il] - pos[ir]
@@ -329,22 +387,125 @@ def forward_kinematics(
     return gpos, grot
 
 
-def resample(data: BvhData, target_fps: float) -> BvhData:
-    """按最近邻抽帧把动作重采样到 ``target_fps``（只做降采样/整数倍抽取近似）。"""
-    if target_fps >= data.fps:
-        return data
-    n_out = int(round(data.num_frames * target_fps / data.fps))
-    idx = np.round(np.linspace(0, data.num_frames - 1, n_out)).astype(int)
+def slice_frames(data: BvhData, start: int, stop: int) -> BvhData:
+    """按帧区间 ``[start, stop)`` 裁剪，骨架部分原样保留。"""
     return BvhData(
         names=data.names,
         parents=data.parents,
         offsets=data.offsets,
         end_sites=data.end_sites,
-        local_quat=data.local_quat[idx],
-        root_pos=data.root_pos[idx],
-        fps=target_fps,
+        local_quat=data.local_quat[start:stop],
+        root_pos=data.root_pos[start:stop],
+        fps=data.fps,
         source_path=data.source_path,
     )
+
+
+def resample(data: BvhData, target_fps: float, method: str = "slerp") -> BvhData:
+    """把动作重采样到 ``target_fps``，升采样与降采样都支持。
+
+    根位置永远走线性插值；关节旋转按 ``method`` 选择：
+
+    ``slerp``
+        对每个关节的四元数序列做球面线性插值（scipy 的 :class:`Slerp`）。角速度
+        沿测地线恒定，是旋转唯一正确的插值方式。
+    ``linear``
+        逐分量线性插值后重新归一化。两个单位四元数逐分量 lerp 的结果模长小于 1
+        （正比于 cos(夹角/2)），不归一化会引入缩放畸变；夹角大时即使归一化也会
+        出现角速度不均匀。只在需要与按此法重采样的现成结果对齐时使用。
+
+    源帧率与目标帧率相同时原样返回。
+    """
+    if target_fps <= 0:
+        raise ValueError(f"目标帧率必须为正: {target_fps}")
+    if abs(target_fps - data.fps) < 1e-9 or data.num_frames < 2:
+        return data
+
+    # 时间轴按"第 0 帧对齐 t=0"构建，保证 T-pose 标定帧原样保留。
+    duration = (data.num_frames - 1) / data.fps
+    src_t = np.arange(data.num_frames) / data.fps
+    n_out = max(int(round(duration * target_fps)) + 1, 2)
+    dst_t = np.clip(np.arange(n_out) / target_fps, src_t[0], src_t[-1])
+
+    root_pos = np.stack(
+        [np.interp(dst_t, src_t, data.root_pos[:, i]) for i in range(3)], axis=-1
+    )
+
+    J = data.local_quat.shape[1]
+    local_quat = np.zeros((n_out, J, 4))
+    if method == "slerp":
+        for j in range(J):
+            rots = Rotation.from_quat(data.local_quat[:, j], scalar_first=True)
+            local_quat[:, j] = Slerp(src_t, rots)(dst_t).as_quat(scalar_first=True)
+    elif method == "linear":
+        for c in range(4):
+            local_quat[:, :, c] = np.stack(
+                [np.interp(dst_t, src_t, data.local_quat[:, j, c]) for j in range(J)], axis=-1
+            )
+        local_quat /= np.maximum(np.linalg.norm(local_quat, axis=-1, keepdims=True), 1e-8)
+    else:
+        raise ValueError(f"未知插值方法: {method}（可用 slerp / linear）")
+
+    return BvhData(
+        names=data.names,
+        parents=data.parents,
+        offsets=data.offsets,
+        end_sites=data.end_sites,
+        local_quat=local_quat,
+        root_pos=root_pos,
+        fps=float(target_fps),
+        source_path=data.source_path,
+    )
+
+
+def prepare_clip(
+    data: BvhData,
+    *,
+    tgt_fps: float | None = None,
+    start: float = 0.0,
+    duration: float | None = None,
+    interpolation: str = "slerp",
+    log: Callable[[str], None] | None = None,
+) -> BvhData:
+    """把整段源动作变成 Stage II 真正求解的那一段。
+
+    顺序是「先扔标定帧、再按秒截取、最后插值」。BVH 开头那帧全零的标定帧必须在插值
+    之前扔掉：它的根位置在原点而第一帧真实姿态里演员可能站在数米之外，两者一插值
+    就会插出一段根本不存在的瞬移。
+
+    这里的三个参数会一并写进 ``motion.npz``，可视化与报告脚本用同样的入参重跑本函数
+    即可拿到与当初逐帧一一对应的人体动作，``frame_indices`` 因此可以直接用。
+
+    Args:
+        data: 原始帧率下的完整动作。
+        tgt_fps: 输出帧率；None 或与源帧率相同则不重采样。
+        start: 起始时刻（秒），相对真实动作的第一帧。
+        duration: 截取时长（秒），None 表示到结尾。
+        interpolation: ``slerp`` 或 ``linear``，见 :func:`resample`。
+        log: 可选的日志回调。
+    """
+    say = log or (lambda _: None)
+    src_fps = data.fps
+    rest = first_motion_frame(data)
+    if rest:
+        say(f"跳过 BVH 开头 {rest} 个合成静止帧（真实动作从此开始）")
+
+    f0 = max(rest, rest + int(round(start * src_fps)))
+    f1 = data.num_frames if duration is None else min(
+        data.num_frames, f0 + int(round(duration * src_fps))
+    )
+    if f1 - f0 < 2:
+        raise ValueError(f"裁剪后只剩 {f1 - f0} 帧，检查 start / duration")
+    clip = slice_frames(data, f0, f1)
+
+    if tgt_fps is None or abs(tgt_fps - src_fps) < 1e-9:
+        say(f"源 {src_fps:.1f} FPS x {clip.num_frames} 帧（未改帧率）")
+        return clip
+
+    out = resample(clip, tgt_fps, method=interpolation)
+    say(f"源 {src_fps:.1f} FPS x {clip.num_frames} 帧 -> {out.fps:.1f} FPS x "
+        f"{out.num_frames} 帧（{interpolation} 插值，{clip.num_frames / src_fps:.1f}s）")
+    return out
 
 
 def first_motion_frame(data: BvhData, tol: float = 1e-9) -> int:
@@ -361,6 +522,30 @@ def first_motion_frame(data: BvhData, tol: float = 1e-9) -> int:
     deviation = np.abs(data.local_quat - ident).max(axis=(1, 2))
     moving = np.where(deviation > tol)[0]
     return int(moving[0]) if len(moving) else 0
+
+
+def static_head_frames(
+    data: BvhData,
+    max_seconds: float = 1.0,
+    pos_tol: float = 0.02,
+    rot_tol_deg: float = 3.0,
+) -> int:
+    """片头演员站定不动的帧数。
+
+    与 :func:`first_motion_frame` 不同：那个找的是导出器写死的合成标定帧（通道
+    严格为零），这里找的是**真人站着没动**的那一段。动捕采集通常留有这么一段，
+    而它是唯一可以信任「脚平放在地上」的时刻，因此适合拿来标定那些解算质量差的
+    通道——踝关节的 roll 尤其容易在腾空/遮挡时跳到错误分支再也回不来。
+
+    判据是相对第 0 帧的偏离：根平移小于 ``pos_tol``，且所有关节的四元数夹角都小于
+    ``rot_tol_deg``。返回满足条件的前导帧数（已按 ``max_seconds`` 截断）。
+    """
+    dots = np.abs(np.einsum("tjk,jk->tj", data.local_quat, data.local_quat[0]))
+    rot_dev = 2.0 * np.arccos(np.clip(dots, -1.0, 1.0)).max(axis=1)
+    pos_dev = np.linalg.norm(data.root_pos - data.root_pos[0], axis=1)
+    ok = (pos_dev < pos_tol) & (rot_dev < np.radians(rot_tol_deg))
+    n = data.num_frames if ok.all() else int(np.argmin(ok))
+    return int(min(n, round(max_seconds * data.fps)))
 
 
 def bone_lengths(data: BvhData) -> dict[str, float]:

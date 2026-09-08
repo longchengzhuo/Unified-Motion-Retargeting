@@ -84,12 +84,24 @@ class FrameScrubber:
         # --- GLFW 窗口 ---
         if not glfw.init():
             raise RuntimeError("GLFW 初始化失败（需要图形界面环境）")
+        # 先隐藏着建，摆好位置再显示。放任窗口管理器摆放的话，多屏环境下它常常落在
+        # 某块屏的角落、并且不抢焦点地压在 IDE 底下，看起来就跟"没弹窗"一样。
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+        glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
         self.window = glfw.create_window(width, height, title, None, None)
+        glfw.default_window_hints()
         if not self.window:
             glfw.terminate()
             raise RuntimeError("GLFW 创建窗口失败")
+        self._place_on_primary(width, height)
+        glfw.show_window(self.window)
+        glfw.focus_window(self.window)
+        glfw.request_window_attention(self.window)  # 窗口管理器拒绝抢焦点时闪任务栏
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
+
+        x, y = glfw.get_window_pos(self.window)
+        print(f'[viewer] 窗口已打开："{title}"  {width}x{height} @ ({x}, {y})')
 
         # --- MuJoCo 渲染资源 ---
         self.scene = mujoco.MjvScene(model, maxgeom=model.ngeom * 2 + max_markers)
@@ -115,6 +127,16 @@ class FrameScrubber:
         glfw.set_cursor_pos_callback(self.window, self._on_mouse_move)
         glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
         glfw.set_scroll_callback(self.window, self._on_scroll)
+
+    def _place_on_primary(self, width: int, height: int) -> None:
+        """把窗口摆到主显示器工作区中央。"""
+        monitor = glfw.get_primary_monitor()
+        if not monitor:
+            return
+        mx, my, mw, mh = glfw.get_monitor_workarea(monitor)
+        glfw.set_window_pos(
+            self.window, mx + max(0, (mw - width) // 2), my + max(0, (mh - height) // 2)
+        )
 
     # ------------------------------------------------------------------
     # 输入回调

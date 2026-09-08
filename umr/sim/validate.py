@@ -25,7 +25,7 @@ import mujoco
 import numpy as np
 from scipy.signal import savgol_filter
 
-from umr.bodies.robot import RobotSpec, lowest_surface_z
+from umr.bodies.robot import geom_lowest_z, is_marker_body, lowest_surface_z
 
 GRAVITY = 9.81
 
@@ -76,78 +76,75 @@ def differentiate_configuration(
     return qvel, qacc
 
 
-@dataclass
-class FootGeometry:
-    """足部接触候选点，按 geom 局部坐标缓存一次，之后每帧只做一次刚体变换。"""
+def foot_contact_points(
+    model: mujoco.MjModel, data: mujoco.MjData, height_tol: float = 0.02
+) -> np.ndarray:
+    """当前姿态下贴近地面的足部几何顶点，投影到水平面。
 
-    geom_ids: np.ndarray   # (P,)
-    local: np.ndarray      # (P, 3) geom 局部坐标
-    radius: np.ndarray     # (P,)   球体的半径偏移，其余为 0
-
-
-def foot_geometry(model: mujoco.MjModel, spec: RobotSpec) -> FootGeometry:
-    """收集足部 geom 上能真正落地的极值点。
-
-    box 取 8 个角点、sphere 取球心配半径偏移、mesh 取凸包顶点。三者都要覆盖：有的机型
-    直接用 box 建足底，有的（如 Unitree G1）足底只有视觉网格、碰撞球嵌在网格里面 15 mm 处，
-    只看基元就会得到"整段动作都腾空"的假象。
+    用 box 的 8 个角点与球心（而不是 geom 中心），这样单脚支撑时支撑多边形仍然
+    有宽度，不会退化成一条线。
     """
-    from scipy.spatial import ConvexHull, QhullError
-
-    signs = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)
-    geom_ids: list[int] = []
-    local: list[np.ndarray] = []
-    radius: list[float] = []
-
+    pts = []
     for g in range(model.ngeom):
         b = int(model.geom_bodyid[g])
         if b == 0:
             continue
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
-        if spec.is_marker(name) or not any(k in name for k in spec.foot_name_keys):
+        if is_marker_body(name) or ("ankle" not in name and "foot" not in name):
             continue
-
+        c = data.geom_xpos[g]
+        R = data.geom_xmat[g].reshape(3, 3)
         size = model.geom_size[g]
         gtype = int(model.geom_type[g])
         if gtype == mujoco.mjtGeom.mjGEOM_BOX:
-            pts, r = signs * size[:3], 0.0
+            signs = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3)
+            corners = c + (signs * size[:3]) @ R.T
         elif gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
-            pts, r = np.zeros((1, 3)), float(size[0])
-        elif gtype == mujoco.mjtGeom.mjGEOM_MESH:
-            mid = int(model.geom_dataid[g])
-            v0, n = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
-            verts = model.mesh_vert[v0 : v0 + n].reshape(-1, 3)
-            try:
-                pts = verts[ConvexHull(verts).vertices]
-            except (QhullError, ValueError):
-                pts = verts
-            r = 0.0
+            corners = np.array([c - [0.0, 0.0, size[0]]])
         else:
             continue
-
-        geom_ids.extend([g] * len(pts))
-        local.extend(pts)
-        radius.extend([r] * len(pts))
-
-    if not geom_ids:
-        raise ValueError(f"找不到足部几何：foot_name_keys={spec.foot_name_keys}")
-    return FootGeometry(
-        geom_ids=np.asarray(geom_ids, dtype=np.int64),
-        local=np.asarray(local, dtype=np.float64),
-        radius=np.asarray(radius, dtype=np.float64),
-    )
+        pts.extend(corners[corners[:, 2] < height_tol][:, :2])
+    return np.array(pts) if pts else np.zeros((0, 2))
 
 
-def foot_contact_points(
-    data: mujoco.MjData, foot: FootGeometry, height_tol: float = 0.02
-) -> np.ndarray:
-    """当前姿态下贴近地面的足部极值点，投影到水平面。
+def foot_geom_sides(model: mujoco.MjModel, kind: str) -> list[list[int]]:
+    """左右脚各自的足部 geom 下标，``kind`` 取 ``"human"`` 或 ``"robot"``。
 
-    用极值点而不是 geom 中心，这样单脚支撑时支撑多边形仍然有宽度，不会退化成一条线。
+    人体 MJCF 的足部是 ``hg_<Side>Ankle`` / ``hg_<Side>Toe`` 这样的 geom 名，机器人
+    一侧则按 geom 所属 body 名里的 ``left_ankle`` / ``right_ankle`` 来找。按帧扫模型
+    很贵，所以先一次性解析出下标，之后逐帧只做取最小值。
     """
-    R = data.geom_xmat[foot.geom_ids].reshape(-1, 3, 3)
-    world = np.einsum("pij,pj->pi", R, foot.local) + data.geom_xpos[foot.geom_ids]
-    return world[world[:, 2] - foot.radius < height_tol][:, :2]
+    if kind == "human":
+        keys = ("Left", "Right")
+    elif kind == "robot":
+        keys = ("left_ankle", "right_ankle")
+    else:
+        raise ValueError(f"kind 只能是 'human' 或 'robot'，收到 {kind!r}")
+
+    sides = []
+    for key in keys:
+        ids = []
+        for g in range(model.ngeom):
+            if kind == "human":
+                name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+                hit = name.startswith(f"hg_{key}") and ("Ankle" in name or "Toe" in name)
+            else:
+                b = int(model.geom_bodyid[g])
+                name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
+                hit = key in name
+            if hit:
+                ids.append(g)
+        if not ids:
+            raise ValueError(f"{kind} 模型里找不到 {key} 一侧的足部 geom")
+        sides.append(ids)
+    return sides
+
+
+def side_foot_heights(
+    model: mujoco.MjModel, data: mujoco.MjData, sides: list[list[int]]
+) -> list[float]:
+    """当前姿态下左右脚各自最低点的高度。"""
+    return [min(geom_lowest_z(model, data, g) for g in ids) for ids in sides]
 
 
 def hull_signed_distance(p: np.ndarray, pts: np.ndarray) -> float:
@@ -189,7 +186,6 @@ def com_zmp(com: np.ndarray, dt: float, floor: float = 0.0, smooth_window: int =
 
 def validate_motion(
     model: mujoco.MjModel,
-    spec: RobotSpec,
     qpos: np.ndarray,
     fps: float,
     compute_support: bool = True,
@@ -224,7 +220,7 @@ def validate_motion(
             base_res[k] = float(np.linalg.norm(f[:6]))
             torque[k] = f[6:]
             com[k] = data.subtree_com[0]
-            foot_h[k] = lowest_surface_z(model, data, spec)
+            foot_h[k] = lowest_surface_z(model, data)
     finally:
         model.opt.disableflags = saved_flags
 
@@ -234,11 +230,10 @@ def validate_motion(
     support_size = np.zeros(n, dtype=np.int64)
     margin = np.full(n, np.nan)
     if compute_support:
-        foot = foot_geometry(model, spec)
         for k in range(n):
             data.qpos[:] = qpos[k]
             mujoco.mj_kinematics(model, data)
-            pts = foot_contact_points(data, foot)
+            pts = foot_contact_points(model, data)
             support_size[k] = len(pts)
             margin[k] = hull_signed_distance(zmp[k], pts)
             support_ok[k] = bool(margin[k] < 0)
@@ -254,66 +249,53 @@ def replay_with_pd(
     model: mujoco.MjModel,
     qpos: np.ndarray,
     fps: float,
-    stiffness: float = 1600.0,
-    damping_ratio: float = 1.0,
-    sim_dt: float = 5e-4,
+    kp: float = 400.0,
+    kd: float = 20.0,
     max_seconds: float | None = None,
     fall_height: float = 0.35,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], np.ndarray]:
     """用 PD 跟踪在 ``mj_step`` 里开环回放参考轨迹。
 
     机器人 MJCF 没有 actuator，这里把 PD 力矩直接写进 ``data.qfrc_applied`` 的关节
     部分，自由基座不施加任何外力，所以这是一次真实的欠驱动仿真。没有平衡控制器，
     因此**跌倒是预期结果**；这里报告的是"在跌倒前能跟住多久"这一可行性指标。
 
-    增益按各关节的**有效惯量** :math:`m^{eff}_j = 1/(M^{-1})_{jj}` 归一化：
-    ``kp = stiffness * m_eff``、``kd = 2ζ·sqrt(stiffness)·m_eff``，于是每个关节的闭环
-    固有频率都是 ``sqrt(stiffness)``，与连杆质量无关。用绝对增益或 ``M_jj`` 对角元都不
-    行——浮动基运动链的耦合会让 ``M_jj`` 高估惯量最多一个量级，轻手腕上会直接发散。
-
-    只保留机器人与地面的接触。重定向默认不做自碰撞规避（``retarget.self_collision``），
-    参考轨迹里手腕贴着髋部这类厘米级自穿透是允许的；若把它们喂给接触求解器，第一步就会
-    产生巨大的恢复力，测到的是初值伪影而不是动力学可行性。
-
-    积分步长取 ``min(sim_dt, MJCF 自带的 timestep)``。脚踝一类连杆的惯量只有 1e-4 量级，
-    若模型没写 ``armature``（Unitree G1 就没有），2 ms 的显式积分一碰地就会发散。
+    Returns:
+        ``(指标, 逐帧仿真 qpos)``。后者形如 ``(帧数, nq)``，只到跌倒那一帧为止，
+        可直接喂给 ``umr.sim.views.launch_replay_viewer`` 与参考轨迹并排回看。
     """
     data = mujoco.MjData(model)
     data.qpos[:] = qpos[0]
+    mujoco.mj_forward(model, data)
 
-    is_world = model.geom_bodyid == 0
-    saved = model.geom_contype.copy(), model.geom_conaffinity.copy(), model.opt.timestep
-    model.geom_contype[:] = 1
-    model.geom_conaffinity[:] = np.where(is_world, 1, 0)
-    model.opt.timestep = min(sim_dt, model.opt.timestep)
+    sim_dt = model.opt.timestep
+    # qfrc_applied 里的阻尼项是显式积分的，稳定条件为 kd*dt/M < 2（M 为关节空间惯量
+    # 对角元）。小惯量关节会让一个固定的 kd 直接发散——armature 只有 4e-4 的头部关节
+    # 在 kd=20 时 kd*dt/M≈16，第 8 个仿真步就 NaN。按自由度截断到稳定域内，惯量足够
+    # 大的关节不受影响。
+    #
+    # 注意这一步救不了完全没写 armature 的模型：腕部这种自由度的 M0 只有 3.7e-4 时，
+    # 光重力就有 127 rad/s^2，两项增益怎么截断都会发散。那属于模型缺转子惯量，只能在
+    # MJCF 里补——G1 的官方文件一个 armature 都没写，本仓库的副本已就地补上。
+    kd_vec = np.minimum(kd, 1.8 * model.dof_M0[6:] / sim_dt)
+    steps_per_frame = max(1, int(round((1.0 / fps) / sim_dt)))
+    n = qpos.shape[0] if max_seconds is None else min(qpos.shape[0], int(max_seconds * fps))
 
-    try:
-        mujoco.mj_forward(model, data)
+    tracking = []
+    rollout = np.empty((n, model.nq))
+    fell_at = -1
+    for k in range(n):
+        ref = qpos[k, 7:]
+        for _ in range(steps_per_frame):
+            data.qfrc_applied[6:] = kp * (ref - data.qpos[7:]) - kd_vec * data.qvel[6:]
+            mujoco.mj_step(model, data)
+        rollout[k] = data.qpos
+        tracking.append(float(np.abs(data.qpos[7:] - ref).mean()))
+        if data.qpos[2] < fall_height:
+            fell_at = k
+            break
 
-        inertia = np.zeros((model.nv, model.nv))
-        mujoco.mj_fullM(model, inertia, data.qM)
-        m_eff = 1.0 / np.diag(np.linalg.inv(inertia))[6:]
-        kp = stiffness * m_eff
-        kd = 2.0 * damping_ratio * np.sqrt(stiffness) * m_eff
-
-        steps_per_frame = max(1, int(round((1.0 / fps) / model.opt.timestep)))
-        n = qpos.shape[0] if max_seconds is None else min(qpos.shape[0], int(max_seconds * fps))
-
-        tracking = []
-        fell_at = -1
-        for k in range(n):
-            ref = qpos[k, 7:]
-            for _ in range(steps_per_frame):
-                data.qfrc_applied[6:] = kp * (ref - data.qpos[7:]) - kd * data.qvel[6:]
-                mujoco.mj_step(model, data)
-            tracking.append(float(np.abs(data.qpos[7:] - ref).mean()))
-            if data.qpos[2] < fall_height:
-                fell_at = k
-                break
-    finally:
-        model.geom_contype[:], model.geom_conaffinity[:], model.opt.timestep = saved
-
-    return {
+    stats = {
         "frames_simulated": len(tracking),
         "frames_total": n,
         "fell_at_frame": fell_at,
@@ -321,3 +303,4 @@ def replay_with_pd(
         "joint_tracking_error_rad": float(np.mean(tracking)) if tracking else float("nan"),
         "final_base_height": float(data.qpos[2]),
     }
+    return stats, rollout[: len(tracking)]

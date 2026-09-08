@@ -41,27 +41,30 @@ their learned counterparts on the robot — same index, same body part, none of 
 ```
 umr/
 ├── environment.yml                     # the only dependency list
-├── run_all.sh                          # end-to-end pipeline
-├── configs/g1_29dof_rev_1_0.yaml       # Unitree G1 (default)
-├── assets/robots/                      # MJCF + STL meshes, one dir per robot
-├── data/                               # source BVH
-├── scripts/01..05_*.py                 # the five pipeline steps
+├── configs/g1_29dof_rev_1_0.yaml       # every hyperparameter, plus the robot block
+├── assets/robots/g1_description/       # MJCF + STL meshes, one dir per robot
+├── data/walk_slow.bvh                  # source clip
+├── scripts/retarget.py                 # entry point 1: all three stages + live player
+├── scripts/report.py                   # entry point 2: dynamics check + metric report
 ├── umr/
-│   ├── bodies/       # BVH parsing, human MJCF generation, robot wrapper, surface sampler
+│   ├── stages.py     # stage orchestration and fingerprint caching
+│   ├── cli.py, config.py, paths.py     # argument parsing, config loading, artifact layout
+│   ├── bootstrap.py  # drops user site-packages, picks the MuJoCo render backend
+│   ├── bodies/       # BVH parsing, skeletons, human MJCF generation, robot wrapper, sampler
 │   ├── correspondence/  # Stage I: network, losses, geodesic graph, training, evaluation
 │   ├── tasks/        # mink.Task subclasses      (Eq. 7, 8)
 │   ├── limits/       # mink.Limit subclasses     (Eq. 13, 14)
 │   ├── retarget/     # link binding, per-frame pipeline, pkl export
-│   └── sim/          # dynamics validation, offline rendering, interactive player
-├── docs/TECHNICAL.md                   # derivations and implementation notes
-└── outputs/<config-name>/              # generated motions, videos, reports
+│   ├── sim/          # dynamics validation, offline rendering, interactive players
+│   └── report.py, metrics.py           # metrics rolled up into report.md / metrics.npz
+└── output/<human>_to_<robot>/          # generated motions, videos, reports
 ```
 
 ## Method
 
 ```mermaid
 flowchart LR
-  bvh["Xsens BVH"] --> hmjcf["procedural human MJCF"]
+  bvh["mocap BVH"] --> hmjcf["procedural human MJCF"]
   hmjcf --> hcfg["mink.Configuration (human)"]
   rmjcf["robot MJCF + T_pose key"] --> rcfg["mink.Configuration (robot)"]
   hcfg --> samp["shared surface sampler"]
@@ -98,6 +101,16 @@ position and normal residuals (Eq. 7) plus a contact-map residual (Eq. 8–11), 
 ground clearance (Eq. 14) and a trust region, via damped Gauss-Newton (Eq. 12–13). The previous
 frame warm-starts the next one.
 
+The optimisation maps onto mink one-to-one, which is why there is no hand-written Gauss-Newton
+loop here: `mink.build_ik` already assembles `min ½Δqᵀ(μI + ΣJᵀWJ)Δq + cᵀΔq s.t. GΔq ≤ h`, so each
+residual only has to be a `Task` and each constraint a `Limit`. The one thing that does need care
+is the Jacobian: `Configuration.get_frame_jacobian` is called **once per body**, never per point,
+and every point on that body is derived from rigid-body kinematics,
+
+$$J_{point} = jac_p - [\Delta]_\times jac_r,\qquad J_{normal} = -[n_w]_\times jac_r$$
+
+so an iteration costs O(nbody) ≈ 25 Jacobian calls instead of O(npoints) = 512.
+
 ## Citation
 
 ```bibtex
@@ -124,100 +137,221 @@ Python 3.10, mujoco 3.9.0, mink 1.1.1, clarabel 0.11.1, torch 2.12.0. Verify:
 python -c "import qpsolvers; assert 'clarabel' in qpsolvers.available_solvers; print('ok')"
 ```
 
-A GPU is optional and only used by Stage I training (~22 s on an RTX 3090, ~11 min on 28 CPU cores).
-`correspondence.device: auto` falls back to CPU on its own.
+A GPU is optional and only used by Stage I training (~23 s on an RTX 3090, ~11 min on 28 CPU
+cores). `correspondence.device: auto` falls back to CPU on its own. No system CUDA Toolkit is
+needed — the pip torch wheel bundles its own runtime and only wants an NVIDIA driver.
+
+If numpy or mujoco is also installed under `~/.local/lib/python3.10/site-packages`, it shadows the
+conda env. `environment.yml` sets `PYTHONNOUSERSITE=1`, and both entry scripts additionally call
+`umr/bootstrap.py` to drop user site from `sys.path` before importing anything, since that
+variable is only read at interpreter start-up.
 
 ## Quick start
 
 Robot models and the source clip ship with the repo, so this runs as-is:
 
 ```bash
-./run_all.sh                    # Unitree G1, full clip
-./run_all.sh --duration 10      # first 10 s only
+python scripts/retarget.py --motion_file data/walk_slow.bvh --tgt_fps 30
 ```
 
-Results land in `outputs/<config-name>/`. Step by step:
+That runs Stage 0 (human + robot MuJoCo bodies, T-pose surface sampling), Stage I (correspondence
+learning + link binding) and Stage II (per-frame retargeting), then opens the live player.
+`scripts/report.py` reads those artifacts and writes the metric report:
 
 ```bash
-python scripts/01_build_bodies.py           # human + robot MJCF, T-pose surface sampling
-python scripts/02_learn_correspondence.py   # Stage I: correspondence + link binding
-python scripts/03_retarget.py               # Stage II: per-frame retargeting
-python scripts/04_visualize.py --mode corr  # correspondence figure
-python scripts/04_visualize.py --mode video --points    # side-by-side video
-python scripts/04_visualize.py --mode viewer --points   # interactive player
-python scripts/05_validate.py --replay      # dynamics check + metric report
+python scripts/report.py --motion_file data/walk_slow.bvh --replay --corr_image --record_video
 ```
 
-Every script takes `--config`; set `UMR_OUTPUT_DIR` to redirect artifacts. Useful flags:
+Both entry points share the same argument group:
 
 | Flag | Effect |
 |---|---|
-| `03_retarget.py --duration 10` | retarget the first 10 s only |
-| `03_retarget.py --trust_region l2` | exact L2 trust region via Clarabel SOCP (default `box`) |
-| `03_retarget.py --n_selected 1024` | larger selected set $\|I\|$ (slower; see `docs/TECHNICAL.md` §8.3) |
-| `03_retarget.py --solver proxqp` | switch QP backend |
-| `02_learn_correspondence.py --device cpu` | force CPU for Stage I |
+| `--motion_file` | a BVH file, or a directory of them (searched recursively, structure preserved) |
+| `--human` | source skeleton: `xsens` (default) or `fzmotion` |
+| `--robot` | registered name (`unitree_g1`, `g1`) or a path to a config yaml |
+| `--tgt_fps` | output frame rate; defaults to the source rate, which is read from the BVH `Frame Time` header |
+| `--save_path` | artifact root, default `output/` |
+
+Batch processing a whole shoot, with video export, on multiple processes:
+
+```bash
+python scripts/retarget.py --motion_file data/my_session --tgt_fps 30 \
+    --record_video --multi_process --override
+```
+
+Other flags worth knowing:
+
+| Flag | Effect |
+|---|---|
+| `retarget.py --start 5 --duration 10` | retarget seconds 5–15 only |
+| `retarget.py --interpolation_method linear` | normalised lerp instead of slerp when resampling |
+| `retarget.py --tpose_offset 0` | drop the T-pose shape compensation, i.e. Eq. (7) verbatim (see [Results](#results)) |
+| `retarget.py --lock_ankle_roll` | freeze ankle roll at its value during the standing lead-in |
+| `retarget.py --trust_region l2` | exact L2 trust region via Clarabel SOCP (default `box`) |
+| `retarget.py --n_selected 1024` | larger selected set $\|I\|$ (slower) |
+| `retarget.py --solver proxqp` | switch QP backend |
+| `retarget.py --device cpu` | force CPU for Stage I |
+| `retarget.py --share_setup file` | one Stage 0/I setup per file instead of per directory |
+| `report.py --replay` | additionally run the open-loop PD replay |
+| `report.py --replay_viewer` | play the PD replay next to the kinematic reference in a window (implies `--replay`) |
 
 All hyperparameters live in the config file.
 
+### Artifact layout and caching
+
+```
+output/
+├── xsens_to_unitree_g1/
+│   ├── walk_slow.pkl                 # main product, GMR-compatible fields
+│   ├── walk_slow.mp4                 # --record_video
+│   └── walk_slow/
+│       ├── motion.npz                # Stage II result
+│       └── report.md / metrics.npz   # written by report.py
+└── .setup/xsens_to_unitree_g1/<skeleton signature>/
+    ├── human.xml                     # generated human MJCF
+    ├── bodies.npz                    # Stage 0: T-pose surface clouds
+    ├── correspondence.npz            # Stage I: learned correspondence
+    └── correspondence.png            # report.py --corr_image
+```
+
+**Stage 0 and I are shared across clips.** They depend only on the robot, the source skeleton and
+the actor's bone lengths — not on which motion was performed. That is exactly the "reusable point
+cloud correspondence setup" of paper Table I, so they are addressed by a skeleton signature under
+`.setup/`. Batch-processing dozens of takes from one shoot trains the correspondence once.
+`--share_setup file` switches to one setup per file, for directories that mix actors of clearly
+different builds.
+
+**Every stage is fingerprinted.** Each npz carries a hash of its inputs and the relevant config
+sections, chained downstream, so changing `--duration` only re-runs Stage II while changing the
+sample count goes back to Stage 0. `--override` means "don't skip this clip"; `--force` also
+invalidates the stage caches.
+
 ### Interactive player
 
-`--mode viewer` opens a live MuJoCo window that starts paused on frame 0. **Hold →** to play,
+`scripts/retarget.py` opens a live MuJoCo window when it finishes, starting paused on frame 0
+(pointing it at an already-computed clip skips straight to the window). **Hold →** to play,
 **hold ←** to rewind, release to pause. Space toggles autoplay, `.` / `,` single-step,
 `[` / `]` change speed, `T` toggles camera follow, `P` toggles correspondence points, `Esc` quits.
 `--human_offset 0` overlays the human and robot instead of placing them side by side;
-`--robot_only` hides the human.
+`--robot_only` hides the human; `--no_viewer` skips the window entirely.
 
-### Adding a robot or a motion
+`report.py --replay_viewer` opens the same player on the PD replay instead: the robot standing in
+place is the kinematic reference, the one offset along +Y is what the simulation actually tracked.
+`--replay_offset 0` overlays them.
 
-See [`assets/README.md`](assets/README.md) and [`data/README.md`](data/README.md).
-Only the `robot` block of the config differs between robots — nothing in the method is retuned.
+> Neither player uses `mujoco.viewer.launch_passive`: its `key_callback` only fires on key-down,
+> so "release to pause" is impossible. Both build a GLFW window directly and read raw
+> `PRESS` / `REPEAT` / `RELEASE` events — see [`umr/sim/interactive.py`](umr/sim/interactive.py).
+
+### Adding a robot
+
+Drop in the MJCF and meshes, copy `configs/g1_29dof_rev_1_0.yaml`, and register one line in
+`ROBOT_CONFIGS` in [`umr/config.py`](umr/config.py). Nothing else changes — only the `robot` block
+of the config differs between robots, and no hyperparameter is retuned. The morphology keys are
+read by [`RobotSpec`](umr/bodies/robot.py):
+
+| Key | Meaning |
+|---|---|
+| `tpose_joints` | joint angles for the canonical T-pose; everything else is 0 and the base height is solved so the soles touch the floor |
+| `marker_body_prefixes` / `_suffixes` | bodies whose geoms are markers, not outer surface |
+| `foot_bodies` | the ankle links used to measure foot height |
+| `foot_name_keys` | substrings identifying foot bodies when locating sole geometry |
+
+The model itself only has to satisfy four things: it loads with
+`mujoco.MjModel.from_xml_path`, its root is a `<freejoint/>`, its hinge joints carry `range`
+limits (`mink.ConfigurationLimit` needs them for Eq. 13), and its soles are findable via
+`foot_name_keys` (for the Eq. 14 clearance constraint).
+
+**`tpose_joints` is the one that bites.** Do not assume zero means straight. On G1 the elbow is
+perpendicular to the upper arm at angle 0, so setting only the two shoulder rolls yields a fake
+T-pose leaning 45.9° forward with just 0.278 m from shoulder to wrist; the elbows need +90° to
+actually straighten (0.9°, 0.368 m). Stage 0 and I build the correspondence in exactly this pose,
+and getting it wrong skews everything downstream without raising a single error.
+
+A new mocap naming convention means adding one `Skeleton` to
+[`umr/bodies/skeletons.py`](umr/bodies/skeletons.py); as long as it emits the same 21 segment
+labels, everything downstream is unchanged.
+
+> The first run **modifies the MJCF in place**: it injects a `T_pose` keyframe and enlarges the
+> offscreen framebuffer to 1920x1080. This is idempotent.
+>
+> G1's official MJCF was also patched here in two ways that affect dynamics only, never
+> retargeting (all three stages are purely kinematic): `armature="0.01"` on the 29 hinge joints
+> (the value MuJoCo Menagerie uses for `unitree_g1`; the official file sets none, leaving the
+> wrist DoFs at 3.7e-4 joint-space inertia, where gravity alone is 127 rad/s²), and `timestep`
+> from 2 ms to 1 ms. Without them the explicit PD replay in `report.py --replay` diverges to NaN
+> within a few steps.
 
 ## Results
 
-Unitree G1 (29 DoF, 1.32 m), full 71.2 s clip (240 Hz → 30 Hz, 2137 frames), RTX 3090 + i7.
+Unitree G1 (29 DoF, 1.32 m), full 71.2 s clip (240 Hz → 30 Hz, 2138 frames), RTX 3090 + i7.
 
 | Stage I | |
 |---|---|
-| Chamfer recon→target | 19.0 mm |
-| 2 cm coverage | 67.7 % |
-| **Anatomical consistency** | **90.9 %** |
+| Chamfer recon→target | 17.6 mm |
+| 2 cm coverage | 70.4 % |
+| **Anatomical consistency** | **92.3 %** |
 
 | Stage II | |
 |---|---|
-| Point error, median | **31.7 mm** |
-| Normal error, mean | 38.3° |
-| Peak joint torque, median | 5.8 N·m |
-| Foot penetration, max | 0.57 mm |
-| Foot-height tracking, corr L / R | 0.80 / 0.59 |
+| Point error, median | **15.6 mm** |
+| Normal error, mean | 7.1° |
+| Peak joint torque, median | 5.9 N·m |
+| Foot penetration, max | 0.00 mm |
 | Joint limit violations | 0 % |
 | QP failures | 0 |
 
 | Cost | |
 |---|---|
-| Setup (sampling + training + binding) | 44.9 s, once per robot |
-| Retargeting throughput | **63.6 FPS** |
+| Setup (sampling + training + binding) | 41.5 s, once per robot and actor |
+| Retargeting throughput | **43.8 FPS** |
 
 Anatomical consistency measures whether learned correspondences land on the anatomically right
 limb, with **no manual skeleton mapping** anywhere in the pipeline. Per-segment breakdowns are
-printed by `02_learn_correspondence.py`; the 9 % gap is dominated by the head, which G1's 29 DoF
-MJCF folds into `torso_link` and therefore has no link name to match against. The paper reports
-65.29 FPS overall throughput.
+printed by Stage I; the remaining gap is dominated by the head and clavicles, which G1's 29 DoF
+MJCF folds into `torso_link` and which therefore have no link name to match against. The paper
+reports 65.29 FPS overall throughput; self-collision avoidance costs roughly 25% of ours and is on
+by default for G1 (see below).
 
-Full report: `outputs/<config-name>/report.md`. Comparison video: `outputs/<config-name>/retarget.mp4`.
+**The point error is not the metric to minimise.** Eq. (7) asks the robot's surface points to
+reach the human's, but the two bodies still differ by ~56 mm in T-pose after height normalisation
+and no joint angle removes that. `tpose_offset` folds that constant into the target, and the two
+settings trade off against each other:
+
+| Config | Point error, median | Normal error, mean | Foot tracking corr L / R | Contact ratio | Airborne frames |
+|---|---|---|---|---|---|
+| **default** (`tpose_offset 1`) | **15.6 mm** | **7.1°** | 0.47 / 0.07 | 60 % | 47 % |
+| `--tpose_offset 0` | 33.4 mm | 42.1° | **0.67 / 0.64** | **75 %** | **38 %** |
+
+Both keep foot penetration at 0.00 mm, joint limit violations at 0 % and QP failures at 0. G1
+ships with `tpose_offset: 1.0` because the offset is close to uniform across segments once Stage 0
+has normalised the actor to robot height (hand 62 mm, forearm 57 mm, torso 53 mm, foot 51 mm), so
+subtracting it recovers the pose the actor was actually in. The cost is that Eq. (7) no longer
+pins the robot's foot to where the human's foot literally was, and per-foot ground contact
+degrades. Judge retargeting quality by per-foot height tracking, penetration and contact ratio —
+and by whether the joint angles are sane — rather than by Eq. (7)'s residual alone.
+
+**Self-collision avoidance is on for G1.** Its wrists sit exactly at hip height, so in walking
+clips with the arms hanging naturally the wrist cuts into the hip link: 698 of the first 960
+frames self-collide, up to 23.0 mm deep. `retarget.self_collision: true` brings that down to
+3.0 mm at no cost in point error and zero QP failures, for about 25% throughput. Clips where the
+limbs never approach the torso activate no constraints and pay nothing.
+
+Full report: `output/xsens_to_unitree_g1/walk_slow/report.md`.
+Comparison video: `output/xsens_to_unitree_g1/walk_slow.mp4`.
 
 ## Output format
 
-`03_retarget.py` writes `motion.npz` (used by steps 04/05) and `motion.pkl`, whose fields match
-`agmr` / GMR so downstream tooling works unchanged:
+Stage II writes `motion.npz` (used by the player and `report.py`) and a `.pkl` whose fields match
+GMR so downstream tooling works unchanged:
 
 ```python
 {
   "root_trans":  (T, 3),   # base translation
   "root_rot":    (T, 4),   # base rotation, xyzw (downstream convention)
-  "dof":         (T, nj),  # joint angles
-  "dof_full":    (T, nj),
-  "qpos":        (T, nq),  # raw MuJoCo layout, quaternion is wxyz
+  "dof":         (T, 29),  # joint angles
+  "dof_full":    (T, 29),
+  "qpos":        (T, 36),  # raw MuJoCo layout, quaternion is wxyz
   "fps": 30.0, "dof_names": [...], "body_names": [...],
   "quality_metrics": {...}, "point_error": (T,), "normal_error": (T,),
   "contact_count": (T,), "frame_indices": (T,),
@@ -231,18 +365,20 @@ Note `root_rot` is **xyzw** while `qpos` keeps MuJoCo's **wxyz**.
 
 - **Source mesh** is a rigid-body human generated procedurally from the BVH skeleton, not SMPL-X
   with shape fitting. Its surface is piecewise-smooth convex primitives, so normals carry a
-  systematic bias against the robot's faceted CAD meshes; the normal term is weighted low and acts
-  as a soft orientation cue. Paper III-A lists rigged humanoid characters as a valid source.
+  systematic bias against the robot's faceted CAD meshes. Paper III-A lists rigged humanoid
+  characters as a valid source.
 - **Trust region** defaults to the inscribed box of the L2 ball
   ($\|\Delta q\|_\infty \le \eta/\sqrt{n_v}$), which satisfies the L2 constraint with any QP
   backend. `--trust_region l2` uses the Clarabel SOCP branch and matches Eq. (13) exactly.
-- **Ground contact only** — no object, scene, or self-collision, since the bundled clip is walking.
-  `ContactMapTask` is written against a general environment point cloud, so adding objects means
-  replacing `environment`.
+- **Ground contact and self-collision only** — no object or scene interaction, since the bundled
+  clip is walking. `ContactMapTask` is written against a general environment point cloud, so
+  adding objects means replacing `environment`.
 - **No downstream RL.** There is no BeyondMimic / SONIC / OmniRetarget comparison and no LAFAN1
-  benchmark. The PD replay in `05_validate.py` is an **open-loop underactuated** simulation with no
-  balance controller — a kinematic reference is expected to fall. It is a reproducible feasibility
-  probe, not a stability claim.
+  benchmark. The PD replay in `report.py --replay` is an **open-loop underactuated** simulation
+  with no balance controller — a kinematic reference is expected to fall, and this one survives
+  3.9 s at 0.007 rad of joint tracking error before it does. It is a reproducible feasibility
+  probe, not a stability claim; `--replay_viewer` shows the difference between "the joints track
+  fine" and "the robot stays up" directly.
 - **ZMP** uses the standard CoM approximation that ignores angular momentum rate. Walking is
   controlled falling, so single-support ZMP excursions past the foot edge are normal.
 
